@@ -792,7 +792,7 @@ class Scheduler::Impl {
   Result<CompletionOutcome> do_complete(const CompletionReport& r) {
     std::lock_guard<std::mutex> g(mu_);
     CompletionOutcome out;
-    if (r.epoch.value() != epoch_value_) { out.acceptance = CompletionAcceptance::StaleEpoch; out.reason_code = "stale_epoch"; return Result<CompletionOutcome>::ok(std::move(out)); }
+    if (r.epoch.value() != epoch_value_) { out.acceptance = CompletionAcceptance::StaleEpoch; out.reason_code = "stale_epoch"; stats_.stale_rejected += 1; return Result<CompletionOutcome>::ok(std::move(out)); }
     auto wit = workers_.find(r.worker);
     if (wit == workers_.end() || wit->second.registration.boot_id != r.boot_id) { out.acceptance = CompletionAcceptance::StaleWorker; out.reason_code = "stale_worker"; stats_.stale_rejected += 1; return Result<CompletionOutcome>::ok(std::move(out)); }
     auto it = requests_.find(r.request_id); if (it == requests_.end()) { out.acceptance = CompletionAcceptance::Invalid; out.reason_code = "unknown_request"; return Result<CompletionOutcome>::ok(std::move(out)); }

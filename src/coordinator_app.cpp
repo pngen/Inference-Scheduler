@@ -128,7 +128,26 @@ void handle_one(const Json& req, const std::shared_ptr<FramedConnection>& conn) 
     send_json(conn, ack);
   }
   else if (op == "cancel") { RequestId rid(num_u64(req, "request_id")); auto cr = g_ctx->sched.cancel(rid, CancellationReason::ClientRequested, "client"); Json ack = Json::object(); ack["op"] = Json::string("cancel_ack"); ack["ok"] = Json::boolean(cr.ok()); ack["reason"] = Json::string(cr.ok() ? "cancelled" : cr.error().message); send_json(conn, ack); }
-  else if (op == "stats") { auto st = g_ctx->sched.stats(); Json ack = Json::object(); ack["op"] = Json::string("stats_ack"); ack["admitted"] = Json::number(static_cast<double>(st.requests_admitted)); ack["completed"] = Json::number(static_cast<double>(st.requests_completed)); ack["cancelled"] = Json::number(static_cast<double>(st.requests_cancelled)); ack["expired"] = Json::number(static_cast<double>(st.requests_expired)); ack["failed"] = Json::number(static_cast<double>(st.requests_failed)); ack["current_queued"] = Json::number(static_cast<double>(st.current_queued)); ack["current_running"] = Json::number(static_cast<double>(st.current_running)); ack["current_admitted"] = Json::number(static_cast<double>(st.current_admitted)); send_json(conn, ack); }
+  else if (op == "stats") { auto st = g_ctx->sched.stats(); Json ack = Json::object(); ack["op"] = Json::string("stats_ack"); ack["admitted"] = Json::number(static_cast<double>(st.requests_admitted)); ack["completed"] = Json::number(static_cast<double>(st.requests_completed)); ack["cancelled"] = Json::number(static_cast<double>(st.requests_cancelled)); ack["expired"] = Json::number(static_cast<double>(st.requests_expired)); ack["failed"] = Json::number(static_cast<double>(st.requests_failed)); ack["current_queued"] = Json::number(static_cast<double>(st.current_queued)); ack["current_running"] = Json::number(static_cast<double>(st.current_running)); ack["current_admitted"] = Json::number(static_cast<double>(st.current_admitted)); ack["stale_rejected"] = Json::number(static_cast<double>(st.stale_rejected)); ack["retries"] = Json::number(static_cast<double>(st.retries)); send_json(conn, ack); }
+  else if (op == "roll_epoch") { g_ctx->sched.roll_epoch(); Json ack = Json::object(); ack["op"] = Json::string("roll_epoch_ack"); ack["epoch"] = id_json(g_ctx->sched.epoch().value()); send_json(conn, ack); }
+  else if (op == "request_info") { RequestId rid(num_u64(req, "request_id")); auto sn = g_ctx->sched.request_snapshot(rid); Json ack = Json::object(); ack["op"] = Json::string("request_info_ack"); if (sn.ok()) { ack["exists"] = Json::boolean(true); ack["attempt"] = id_json(sn.value().attempt_id.value()); ack["generation"] = id_json(sn.value().generation.value()); ack["state"] = Json::number(static_cast<int>(sn.value().state)); } else { ack["exists"] = Json::boolean(false); } send_json(conn, ack); }
+  else if (op == "complete") {
+    CompletionReport c;
+    c.epoch = SchedulerEpoch(num_u64(req, "epoch"));
+    c.worker = WorkerId(num_u64(req, "worker"));
+    c.boot_id = WorkerBootId(num_u64(req, "boot"));
+    c.request_id = RequestId(num_u64(req, "request"));
+    c.attempt_id = AttemptId(num_u64(req, "attempt"));
+    c.generation = Generation(num_u64(req, "generation"));
+    c.status = static_cast<CompletionStatus>(static_cast<int>(req.getnum("status", 0)));
+    c.worker_snapshot.available_capacity_units = static_cast<int>(req.getnum("units", 0));
+    c.worker_snapshot.total_capacity_units = static_cast<int>(req.getnum("units", 0));
+    auto co = g_ctx->sched.complete_attempt(c);
+    Json ack = Json::object(); ack["op"] = Json::string("complete_ack");
+    ack["acceptance"] = Json::number(static_cast<int>(co.ok() ? co.value().acceptance : CompletionAcceptance::Invalid));
+    ack["reason"] = Json::string(co.ok() ? co.value().reason_code : "error");
+    send_json(conn, ack);
+  }
   else if (op == "shutdown") { Json ack = Json::object(); ack["op"] = Json::string("bye"); send_json(conn, ack); }
 }
 

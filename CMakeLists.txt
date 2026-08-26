@@ -115,7 +115,7 @@ if(IS_BUILD_TESTS)
     add_test(NAME ${t} COMMAND ${t})
   endforeach()
   if(WIN32)
-    add_test(NAME multiprocess_proof COMMAND powershell -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/scripts/multiprocess_proof.ps1 -Port 29840)
+    add_test(NAME multiprocess_proof COMMAND powershell -ExecutionPolicy Bypass -File ${CMAKE_CURRENT_SOURCE_DIR}/scripts/multiprocess_proof.ps1 -Port 29840 -BuildDir ${CMAKE_CURRENT_BINARY_DIR})
   endif()
 endif()
 

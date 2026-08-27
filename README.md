@@ -250,15 +250,6 @@ batch_shrink is average members per formed batch (batching benefit); and
 plan_dispatch latency is the median single-decision cost. No asynchronous
 submission timing is reported as throughput while work remains unfinished.
 
-## Limitations
-
-Inference Scheduler does not perform model inference, tokenization, model loading,
-KV-cache management, memory allocation, or transport beyond the framed TCP control
-plane. It is not a load balancer that merely round-robins requests, and it is not
-a full inference engine. Backend execution capability is supplied by callers or by
-the provided CPU and CUDA executors; the distributed proof uses the CPU executor.
-
 ## License
 
-Apache License 2.0. See `LICENSE` and `NOTICE`. Contributions are accepted on
-Apache 2.0 terms without a CLA; see `CONTRIBUTING.md`.
+Apache License 2.0. Copyright 2026 Summon Software Labs. No telemetry transmission.

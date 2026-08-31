@@ -205,7 +205,7 @@ scripts\build.ps1 -Configuration Debug              # debug build
 
 ## Tests
 
-All tests are registered with CTest and run to natural completion (no timeouts):
+All tests are registered with CTest and run to completion:
 
 ```powershell
 ctest --test-dir build --output-on-failure

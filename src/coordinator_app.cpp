@@ -16,11 +16,15 @@ using namespace inference_scheduler::net;
 struct WorkerSlot {
   std::mutex mu;
   std::condition_variable cv;
+  // One dispatch at a time per worker: the result fields below hold a single
+  // batch's outcome, and a "run" frame must not interleave with another.
+  std::mutex dispatch_mu;
   std::shared_ptr<FramedConnection> conn;
   WorkerId worker;
   WorkerBootId boot;
   int units = 1;
   bool has_result = false;
+  bool gone = false;  // the worker's connection has ended
   Json result;
 };
 
@@ -35,6 +39,24 @@ struct Coordinator {
 };
 
 static Coordinator* g_ctx = nullptr;
+
+// A worker whose connection ended holds nothing any more. If this slot still
+// speaks for its worker id, the scheduler takes back whatever the worker was
+// handed, so those requests get a new attempt; a restarted worker that already
+// registered under the same id is left alone. A dispatch waiting on the slot is
+// released. Registration takes the same lock, so the two cannot interleave.
+void drop_worker(const std::shared_ptr<WorkerSlot>& slot) {
+  {
+    std::lock_guard<std::mutex> g(g_ctx->wm);
+    auto it = g_ctx->by_worker.find(slot->worker);
+    if (it != g_ctx->by_worker.end() && it->second == slot) {
+      g_ctx->by_worker.erase(it);
+      g_ctx->sched.unregister_worker(slot->worker);
+    }
+  }
+  { std::lock_guard<std::mutex> g(slot->mu); slot->gone = true; }
+  slot->cv.notify_all();
+}
 
 void worker_thread(std::shared_ptr<WorkerSlot> slot) {
   while (true) {
@@ -91,6 +113,7 @@ void worker_thread(std::shared_ptr<WorkerSlot> slot) {
       slot->cv.notify_all();
     } else if (op == "shutdown") { break; }
   }
+  drop_worker(slot);
 }
 
 void handle_one(const Json& req, const std::shared_ptr<FramedConnection>& conn) {
@@ -111,6 +134,7 @@ void handle_one(const Json& req, const std::shared_ptr<FramedConnection>& conn) 
     const DispatchOutcome& o = out.value();
     auto slot = g_ctx->find(o.worker_id);
     if (!slot) { ack["decision"] = Json::number(static_cast<int>(DispatchDecision::NoEligibleWorker)); ack["reason"] = Json::string("worker_gone"); ack["members"] = Json::array(); send_json(conn, ack); return; }
+    std::lock_guard<std::mutex> turn(slot->dispatch_mu);
     { std::lock_guard<std::mutex> g(slot->mu); slot->has_result = false; }
     Json runm = Json::object(); runm["op"] = Json::string("run"); runm["batch_id"] = id_json(o.batch_id.value()); Json members = Json::array();
     for (auto mid : o.batch_members) {
@@ -122,8 +146,15 @@ void handle_one(const Json& req, const std::shared_ptr<FramedConnection>& conn) 
       members.arr.push_back(mj);
     }
     runm["members"] = members;
-    send_json(slot->conn, runm);
-    Json done; { std::unique_lock<std::mutex> lk(slot->mu); slot->cv.wait(lk, [&]{ return slot->has_result; }); done = slot->result; }
+    const bool sent = send_json(slot->conn, runm);
+    Json done; bool answered = false;
+    if (sent) { std::unique_lock<std::mutex> lk(slot->mu); slot->cv.wait(lk, [&]{ return slot->has_result || slot->gone; }); if (slot->has_result) { done = slot->result; answered = true; } }
+    if (!answered) {
+      // The worker never answered: it is gone, and what it was handed goes back
+      // to the scheduler instead of this dispatch waiting on it for good.
+      drop_worker(slot);
+      ack["decision"] = Json::number(static_cast<int>(DispatchDecision::NoEligibleWorker)); ack["reason"] = Json::string("worker_gone"); ack["members"] = Json::array(); send_json(conn, ack); return;
+    }
     ack["decision"] = Json::number(static_cast<int>(DispatchDecision::Dispatch)); ack["worker"] = id_json(o.worker_id.value()); ack["batch"] = id_json(o.batch_id.value()); ack["reason"] = Json::string("dispatched"); ack["members"] = done.get("results") ? done["results"] : Json::array(); ack["done"] = done;
     send_json(conn, ack);
   }
@@ -184,8 +215,7 @@ int main(int argc, char** argv) {
       reg.state = WorkerState::Online; reg.capability.backend = first.getstr("backend", "cpu"); reg.capability.device_name = first.getstr("device", "cpu");
       reg.capability.total_capacity_units = slot->units; reg.capability.available_capacity_units = slot->units;
       if (const Json* models = first.get("models")) { for (const auto& mm : models->arr) { reg.capability.models.push_back(ModelIdentity(jsu64(mm))); } }
-      g_ctx->sched.register_worker(reg);
-      { std::lock_guard<std::mutex> g(g_ctx->wm); g_ctx->workers.push_back(slot); g_ctx->by_worker[slot->worker] = slot; }
+      { std::lock_guard<std::mutex> g(g_ctx->wm); g_ctx->sched.register_worker(reg); g_ctx->workers.push_back(slot); g_ctx->by_worker[slot->worker] = slot; }
       std::printf("coordinator: registered worker %llu\n", (unsigned long long)slot->worker.value());
       std::thread(worker_thread, slot).detach();
     } else {

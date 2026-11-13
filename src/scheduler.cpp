@@ -127,6 +127,7 @@ struct RequestRecord {
   BatchId batch_id;
   int attempts_used = 0;
   std::uint64_t last_attempt_order = 0;
+  bool counted_running = false;  // its tenant's running count includes it
 };
 struct TenantRecord {
   TenantId tenant;
@@ -205,6 +206,21 @@ std::int64_t ceil_cost(double c) { return c <= 0.0 ? 1 : static_cast<std::int64_
 int phase_int(RequestPhase p) { return static_cast<int>(p); }
 int latency_int(LatencyClass c) { return static_cast<int>(c); }
 int priority_int(PriorityClass c) { return static_cast<int>(c); }
+
+// Whether an integer is one of an enum's values. Each of these enums counts up
+// from zero, so its last enumerator bounds the range.
+template <class E>
+bool enum_in_range(std::int64_t v, E last) { return v >= 0 && v <= static_cast<std::int64_t>(last); }
+bool class_values_ok(const RequestSpec& s) {
+  return enum_in_range(phase_int(s.phase), RequestPhase::Decode) &&
+         enum_in_range(priority_int(s.priority), PriorityClass::Critical) &&
+         enum_in_range(latency_int(s.latency_class), LatencyClass::Interactive);
+}
+// Sum of two non-negative counts that stops at the top of the range.
+std::int64_t sat_add(std::int64_t a, std::int64_t b) {
+  const std::int64_t top = std::numeric_limits<std::int64_t>::max();
+  return a > top - b ? top : a + b;
+}
 }  // namespace
 
 class Scheduler::Impl {
@@ -239,6 +255,7 @@ class Scheduler::Impl {
   std::int64_t global_reserved_units_ = 0;
   std::int64_t global_running_units_ = 0;
   std::int64_t global_tokens_ = 0;
+  std::int64_t active_tenants_ = 0;  // tenants holding at least one admitted request
 
   bool draining_ = false;
   std::string drain_reason_;
@@ -282,6 +299,12 @@ class Scheduler::Impl {
     std::lock_guard<std::mutex> g(mu_);
     auto check = validate_spec(spec);
     if (!check) return Result<AdmissionOutput>::err(check.error());
+    if (pre) {
+      if (!pre->valid()) return Result<AdmissionOutput>::err(make_error(ErrorCode::InvalidArgument, "preassigned request id is not valid"));
+      // A request id names one request for good. Submitting it again must not
+      // disturb the request that already holds it.
+      if (requests_.count(*pre) != 0) return Result<AdmissionOutput>::err(make_error(ErrorCode::AlreadyExists, "request id already in use"));
+    }
     AdmissionOutput out;
     RequestId rid = pre ? *pre : id_factory_.next<RequestIdTag>();
     const ClockTime now = clock_->now();
@@ -314,8 +337,7 @@ class Scheduler::Impl {
       // push then enqueue (requests_ owns the record; enqueue mutates it)
       requests_.insert({rid, std::move(rec)});
       enqueue_request(requests_[rid]);
-      global_admitted_ += 1;
-      tenant_of(spec.tenant).admitted += 1;
+      hold_admission(spec);
       out.request_id = rid; out.attempt_id = requests_[rid].current_attempt; out.generation = requests_[rid].generation;
       out.explanation = "admitted; queued for scheduling";
       emit_event("admitted", rid, out.attempt_id, WorkerId(), BatchId(), "admitted");
@@ -340,10 +362,41 @@ class Scheduler::Impl {
     if (!s.tenant.valid()) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "tenant id required"));
     if (!s.model.valid()) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "model identity required"));
     if (s.tokens.input < 0 || s.tokens.output < 0 || s.tokens.decoded < 0) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "negative token estimate"));
+    // Input and output are summed for the token budget and the batch token cap.
+    if (s.tokens.input > std::numeric_limits<std::int64_t>::max() - s.tokens.output) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "token estimate out of range"));
     if (s.demand.cost_units < 0.0) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "negative cost units"));
+    // Worker capacity is counted in int units: a cost beyond that range, or one
+    // that is not a number, can never be placed on any worker.
+    if (!(s.demand.cost_units <= static_cast<double>(std::numeric_limits<int>::max()))) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "cost units out of range"));
     if (s.estimated_memory_bytes < 0) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "negative memory estimate"));
     if (s.max_batch_size < 0) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "negative max batch size"));
+    // The class values index the policy weight tables and per-class statistics.
+    if (!class_values_ok(s)) return Result<void>::err(make_error(ErrorCode::InvalidArgument, "phase, priority or latency class out of range"));
     return Result<void>::success();
+  }
+
+  // A request holds one admission slot, one of its tenant's, and its tokens of
+  // the global budget from the moment it is admitted until it becomes terminal.
+  void hold_admission(const RequestSpec& spec) {
+    global_admitted_ += 1;
+    TenantRecord& t = tenant_of(spec.tenant);
+    if (t.admitted == 0) active_tenants_ += 1;
+    t.admitted += 1;
+    global_tokens_ = sat_add(global_tokens_, spec.tokens.total());
+  }
+  void release_admission(const RequestRecord& rec) {
+    if (global_admitted_ > 0) global_admitted_ -= 1;
+    TenantRecord& t = tenant_of(rec.spec.tenant);
+    if (t.admitted > 0) { t.admitted -= 1; if (t.admitted == 0 && active_tenants_ > 0) active_tenants_ -= 1; }
+    global_tokens_ -= std::min(global_tokens_, rec.spec.tokens.total());
+  }
+  // The tenant's running count covers a request from its confirmed start until
+  // that attempt ends, however it ends.
+  void leave_running(RequestRecord& rec) {
+    if (!rec.counted_running) return;
+    rec.counted_running = false;
+    TenantRecord& t = tenant_of(rec.spec.tenant);
+    if (t.running > 0) t.running -= 1;
   }
 
   std::pair<AdmissionDecision, std::string> make_admission(const RequestSpec& spec, ClockTime now) const {
@@ -371,11 +424,16 @@ class Scheduler::Impl {
       return {AdmissionDecision::Defer, "global_queue_saturated"};
     }
     if (a.max_global_token_budget > 0 &&
-        global_tokens_ + spec.tokens.total() > a.max_global_token_budget) {
+        spec.tokens.total() > a.max_global_token_budget - std::min(global_tokens_, a.max_global_token_budget)) {
       return {AdmissionDecision::Defer, "token_budget_exhausted"};
     }
     TenantId t = spec.tenant;
     auto it = tenants_.find(t);
+    // A tenant holding no admitted work would become one more active tenant.
+    if (a.max_tenants > 0 && (it == tenants_.end() || it->second.admitted == 0) &&
+        active_tenants_ >= a.max_tenants) {
+      return {AdmissionDecision::Defer, "tenant_limit_reached"};
+    }
     const int conc = a.default_tenant_concurrency;
     const int depth = a.default_tenant_queue_depth;
     if (it != tenants_.end() && it->second.admitted >= conc) {
@@ -453,9 +511,9 @@ class Scheduler::Impl {
     dequeue_request(rec);
     rec.state = RequestState::Expired; rec.terminal_reason = "deadline_expired";
     if (!rec.history.empty()) rec.history.back().state = AttemptState::Expired;
-    if (global_admitted_ > 0) global_admitted_ -= 1;
-    auto& t = tenant_of(rec.spec.tenant); if (t.admitted > 0) t.admitted -= 1;
+    release_admission(rec);
     stats_.requests_expired += 1;
+    stats_.by_latency[latency_index(rec.spec.latency_class)].expired += 1;
     if (cfg_.batch.max_wait.count() >= 0 && rec.spec.deadline.valid()) emit_event("expired", rec.request_id, rec.current_attempt, WorkerId(), BatchId(), "deadline_expired");
   }
   void expire_scan(ClockTime now) {
@@ -474,9 +532,12 @@ class Scheduler::Impl {
     }
     return v;
   }
-  std::optional<RequestId> pick_seed(ClockTime now) {
-    bool found = false; FlowKey best;
-    double bf = std::numeric_limits<double>::infinity();
+  // The head of every active flow, most deserving first: lowest effective
+  // virtual finish, then flow key. Entries that are no longer queued are
+  // dropped on the way, and heads whose deadline has passed are expired.
+  std::vector<RequestId> runnable_heads(ClockTime now) {
+    struct Head { double finish; FlowKey key; RequestId id; };
+    std::vector<Head> heads;
     for (auto it = active_flows_.begin(); it != active_flows_.end();) {
       Flow& f = flows_[*it];
       bool alive = false;
@@ -489,13 +550,18 @@ class Scheduler::Impl {
         alive = true; break;
       }
       if (!alive) { auto rm = it++; active_flows_.erase(rm); continue; }
-      RequestRecord& r = requests_[f.pending.top().id];
-      double eff = effective_finish(f, r, now);
-      if (!found || eff < bf || (eff == bf && *it < best)) { bf = eff; best = *it; found = true; }
+      const RequestRecord& r = requests_[f.pending.top().id];
+      heads.push_back({effective_finish(f, r, now), *it, f.pending.top().id});
       ++it;
     }
-    if (!found) return std::nullopt;
-    return flows_[best].pending.top().id;
+    std::sort(heads.begin(), heads.end(), [](const Head& a, const Head& b) {
+      if (a.finish != b.finish) return a.finish < b.finish;
+      return a.key < b.key;
+    });
+    std::vector<RequestId> out;
+    out.reserve(heads.size());
+    for (const auto& h : heads) out.push_back(h.id);
+    return out;
   }
   void account_flow(const RequestSpec& spec, double cost) {
     const FlowKey k = flow_key(spec);
@@ -538,10 +604,35 @@ class Scheduler::Impl {
     std::int64_t tok = s.spec.tokens.total();
     for (auto id : cands) {
       if (static_cast<int>(result.size()) >= maxb) break;
-      if (cfg_.batch.max_tokens > 0) { std::int64_t add = requests_[id].spec.tokens.total(); if (tok + add > cfg_.batch.max_tokens) break; tok += add; }
+      const RequestSpec& cs = requests_[id].spec;
+      // A member's own batch-size cap binds every batch it joins, not only the
+      // ones it seeds.
+      if (cs.max_batch_size > 0 && cs.max_batch_size < maxb) {
+        if (static_cast<int>(result.size()) >= cs.max_batch_size) continue;
+        maxb = cs.max_batch_size;
+      }
+      if (cfg_.batch.max_tokens > 0) { const std::int64_t add = cs.tokens.total(); if (add > cfg_.batch.max_tokens - tok) break; tok += add; }
       result.push_back(id);
     }
     return result;
+  }
+
+  // Units a worker can still take. What it reports as free is believed, but
+  // never beyond what its registered capacity leaves once the work known to be
+  // running there is counted; reservations not yet started come off as well.
+  std::int64_t free_units(const WorkerRecord& wr) const {
+    std::int64_t free = wr.resource.available_capacity_units;
+    const std::int64_t total = wr.registration.capability.total_capacity_units;
+    if (total > 0) free = std::min(free, total - wr.running_units);
+    return free - wr.reserved_units;
+  }
+  // A worker's report of its free units is taken at its word, up to the
+  // capacity it registered with.
+  void apply_reported_capacity(WorkerRecord& wr, const ResourceSnapshot& snap) {
+    if (snap.available_capacity_units < 0) return;
+    const int total = wr.registration.capability.total_capacity_units;
+    wr.resource.available_capacity_units = total > 0 ? std::min(snap.available_capacity_units, total) : snap.available_capacity_units;
+    wr.resource.queue_depth = snap.queue_depth;
   }
 
   // ----- dispatch scoring -----
@@ -553,7 +644,7 @@ class Scheduler::Impl {
     if (wr.state != WorkerState::Online && wr.state != WorkerState::Busy) { s.reject_reason_code = "worker_not_online"; return s; }
     if (!compatible(spec, cap)) { s.reject_reason_code = "incompatible"; return s; }
     const std::int64_t cost = ceil_cost(batch_cost);
-    std::int64_t avail = wr.resource.available_capacity_units - wr.reserved_units;
+    const std::int64_t avail = free_units(wr);
     if (cap.total_capacity_units > 0) {
       if (avail < cost) { s.reject_reason_code = "no_capacity"; return s; }
       if (cost > cap.total_capacity_units) { s.reject_reason_code = "oversized"; return s; }
@@ -594,7 +685,17 @@ class Scheduler::Impl {
     std::vector<WorkerScore> scores;
     if (members.empty()) return {WorkerId(), scores};
     const RequestSpec& spec = requests_.at(members[0]).spec;
-    for (const auto& [wk, wr] : workers_) { scores.push_back(score_worker(wr, spec, batch_cost, now)); }
+    for (const auto& [wk, wr] : workers_) {
+      WorkerScore sc = score_worker(wr, spec, batch_cost, now);
+      // Members share the seed's model, revision and adapter but, when phases
+      // may mix, not its phase: each one has to be something this worker runs.
+      for (std::size_t i = 1; sc.eligible && i < members.size(); ++i) {
+        if (!compatible(requests_.at(members[i]).spec, wr.registration.capability)) {
+          sc.eligible = false; sc.total = 0.0; sc.components.clear(); sc.reject_reason_code = "incompatible_member";
+        }
+      }
+      scores.push_back(std::move(sc));
+    }
     WorkerId best;
     double bestv = -std::numeric_limits<double>::infinity();
     bool found = false;
@@ -639,8 +740,7 @@ class Scheduler::Impl {
     rec.history.back().duration_us = r.duration_us;
     rec.state = RequestState::Completed; rec.terminal_reason.clear();
     release_batch_member(rec, r.worker);
-    if (global_admitted_ > 0) global_admitted_ -= 1;
-    auto& t = tenant_of(rec.spec.tenant); if (t.admitted > 0) t.admitted -= 1; if (t.running > 0) t.running -= 1;
+    release_admission(rec); leave_running(rec);
     stats_.requests_completed += 1; stats_.completions += 1;
     stats_.by_latency[latency_index(rec.spec.latency_class)].completed += 1;
     emit_event("completed", rec.request_id, rec.current_attempt, r.worker, rec.batch_id, rec.terminal_reason);
@@ -652,8 +752,7 @@ class Scheduler::Impl {
     rec.history.back().error_message = r.error_message;
     release_batch_member(rec, r.worker);
     rec.state = RequestState::Failed; rec.terminal_reason = name_of(r.failure_class);
-    if (global_admitted_ > 0) global_admitted_ -= 1;
-    auto& t = tenant_of(rec.spec.tenant); if (t.admitted > 0) t.admitted -= 1; if (t.running > 0) t.running -= 1;
+    release_admission(rec); leave_running(rec);
     stats_.requests_failed += 1; stats_.completions += 1;
     emit_event("failed", rec.request_id, rec.current_attempt, r.worker, rec.batch_id, rec.terminal_reason);
   }
@@ -661,14 +760,13 @@ class Scheduler::Impl {
     if (is_terminal(rec.state)) return;
     if (rec.state == RequestState::Reserved || rec.state == RequestState::Dispatched || rec.state == RequestState::Running) {
       release_batch_member(rec, w);
-      auto& t = tenant_of(rec.spec.tenant); if (t.running > 0) t.running -= 1;
+      leave_running(rec);
     }
     dequeue_request(rec);
     rec.cancellation_committed = true;
     rec.state = RequestState::Cancelled; rec.terminal_reason = std::move(reason);
     if (!rec.history.empty()) { rec.history.back().state = AttemptState::Cancelled; rec.history.back().final_status = CompletionStatus::Cancelled; }
-    if (global_admitted_ > 0) global_admitted_ -= 1;
-    auto& t = tenant_of(rec.spec.tenant); if (t.admitted > 0) t.admitted -= 1;
+    release_admission(rec);
     stats_.requests_cancelled += 1;
     emit_event("cancelled", rec.request_id, rec.current_attempt, w, rec.batch_id, rec.terminal_reason);
   }
@@ -685,7 +783,7 @@ class Scheduler::Impl {
     rec.history.back().failure_class = r.failure_class;
     rec.history.back().error_message = r.error_message;
     release_batch_member(rec, r.worker);
-    auto& t = tenant_of(rec.spec.tenant); if (t.running > 0) t.running -= 1;
+    leave_running(rec);
     rec.generation = id_factory_.next<GenerationTag>();
     rec.current_attempt = id_factory_.next<AttemptIdTag>();
     AttemptRecord a; a.attempt_id = rec.current_attempt; a.generation = rec.generation; a.state = AttemptState::Created; a.created_at = clock_->now();
@@ -701,6 +799,9 @@ class Scheduler::Impl {
     std::lock_guard<std::mutex> g(mu_);
     const ClockTime now = clock_->now();
     expire_scan(now);
+    return plan_dispatch_locked(request, explain, now);
+  }
+  Result<DispatchOutcome> plan_dispatch_locked(RequestId request, bool explain, ClockTime now) {
     auto it = requests_.find(request);
     if (it == requests_.end()) return Result<DispatchOutcome>::err(make_error(ErrorCode::NotFound, "request not found"));
     RequestRecord& rec = it->second;
@@ -716,9 +817,19 @@ class Scheduler::Impl {
     // batched members
     std::vector<RequestId> members = form_batch(request, now);
     if (members.empty()) members.push_back(request);
-    double batch_cost = 0.0; std::int64_t batch_units = 0;
-    for (auto id : members) { const RequestSpec& sp = requests_[id].spec; batch_cost += std::max(1.0, sp.demand.cost_units); batch_units += ceil_cost(sp.demand.cost_units); }
-    auto sel = select_worker(members, batch_cost, now);
+    std::int64_t batch_units = 0;
+    std::pair<WorkerId, std::vector<WorkerScore>> sel;
+    // A batch is only as large as some worker can take. When no worker has
+    // room for all of it, the least urgent members stay queued rather than the
+    // whole batch going nowhere. The units a worker is asked for are the units
+    // that are then reserved on it.
+    while (true) {
+      batch_units = 0;
+      for (auto id : members) batch_units += ceil_cost(requests_[id].spec.demand.cost_units);
+      sel = select_worker(members, static_cast<double>(batch_units), now);
+      if (sel.first.valid() || members.size() == 1) break;
+      members.pop_back();
+    }
     out.candidates = sel.second;
     if (!sel.first.valid()) {
       out.decision = DispatchDecision::NoEligibleWorker; out.reason_code = "no_eligible_worker";
@@ -726,7 +837,7 @@ class Scheduler::Impl {
       return Result<DispatchOutcome>::ok(std::move(out));
     }
     WorkerRecord& wr = workers_[sel.first];
-    std::int64_t avail = wr.resource.available_capacity_units - wr.reserved_units;
+    const std::int64_t avail = free_units(wr);
     if (wr.registration.capability.total_capacity_units > 0 && batch_units > avail) {
       out.decision = DispatchDecision::Hold; out.reason_code = "reservation_capacity_exceeded";
       return Result<DispatchOutcome>::ok(std::move(out));
@@ -741,7 +852,8 @@ class Scheduler::Impl {
       dequeue_request(m);
       account_flow(m.spec, std::max(1.0, m.spec.demand.cost_units));
       m.state = RequestState::Reserved; m.reserved_at = now; m.in_batch = true; m.batch_id = bid;
-      if (!m.history.empty()) m.history.back().state = AttemptState::Reserved;
+      // The attempt now belongs to this worker: only it may start or complete it.
+      if (!m.history.empty()) { m.history.back().state = AttemptState::Reserved; m.history.back().worker = sel.first; m.history.back().batch = bid; }
       emit_event("reserved", m.request_id, m.current_attempt, sel.first, bid, m.terminal_reason);
     }
     out.estimated_cost_units = batch_units;
@@ -752,15 +864,21 @@ class Scheduler::Impl {
     return Result<DispatchOutcome>::ok(std::move(out));
   }
   Result<DispatchOutcome> do_plan_next(bool explain) {
-    std::optional<RequestId> seed;
-    {
-      std::lock_guard<std::mutex> g(mu_);
-      const ClockTime now = clock_->now();
-      expire_scan(now);
-      seed = pick_seed(now);
+    std::lock_guard<std::mutex> g(mu_);
+    const ClockTime now = clock_->now();
+    expire_scan(now);
+    const std::vector<RequestId> heads = runnable_heads(now);
+    if (heads.empty()) { DispatchOutcome o; o.decision = DispatchDecision::Hold; o.reason_code = "no_runnable"; return Result<DispatchOutcome>::ok(std::move(o)); }
+    // The most deserving flow goes first, but a head that no worker can take
+    // right now does not hold up the flows behind it.
+    Result<DispatchOutcome> first;
+    bool have_first = false;
+    for (const RequestId seed : heads) {
+      Result<DispatchOutcome> r = plan_dispatch_locked(seed, explain, now);
+      if (!r.ok() || r.value().decision == DispatchDecision::Dispatch) return r;
+      if (!have_first) { first = std::move(r); have_first = true; }
     }
-    if (!seed) { DispatchOutcome o; o.decision = DispatchDecision::Hold; o.reason_code = "no_runnable"; return Result<DispatchOutcome>::ok(std::move(o)); }
-    return do_plan_dispatch(*seed, explain);
+    return first;
   }
   Result<void> do_confirm_start(const CompletionReport& r) {
     std::lock_guard<std::mutex> g(mu_);
@@ -770,6 +888,8 @@ class Scheduler::Impl {
     if (rec.current_attempt != r.attempt_id || rec.generation != r.generation) return Result<void>::err(make_error(ErrorCode::StaleAttempt, "stale attempt"));
     if (rec.state != RequestState::Reserved) return Result<void>::err(make_error(ErrorCode::InvalidState, "not reserved"));
     auto wit = workers_.find(r.worker); if (wit == workers_.end() || wit->second.registration.boot_id != r.boot_id) return Result<void>::err(make_error(ErrorCode::StaleWorker, "stale worker"));
+    // The attempt was reserved on one worker; no other worker can start it.
+    if (rec.history.empty() || rec.history.back().worker != r.worker) return Result<void>::err(make_error(ErrorCode::StaleWorker, "attempt is reserved on another worker"));
     WorkerRecord& wr = wit->second;
     if (wr.state == WorkerState::Offline || wr.state == WorkerState::Unhealthy || wr.state == WorkerState::Drained) return Result<void>::err(make_error(ErrorCode::InvalidState, "worker not ready"));
     if (!rec.batch_id.valid()) return Result<void>::err(make_error(ErrorCode::InvalidState, "no batch"));
@@ -782,10 +902,9 @@ class Scheduler::Impl {
     rec.schedule_delay_ms = ms_between(rec.queued_at, rec.started_at);
     rec.history.back().state = AttemptState::Running; rec.history.back().worker = r.worker; rec.history.back().batch = rec.batch_id;
     wr.in_flight[rec.request_id] = rec.current_attempt;
-    auto& t = tenant_of(rec.spec.tenant); t.running += 1;
+    auto& t = tenant_of(rec.spec.tenant); t.running += 1; rec.counted_running = true;
     if (wr.state == WorkerState::Online) wr.state = WorkerState::Busy;
-    if (r.worker_snapshot.available_capacity_units >= 0) { wr.resource.available_capacity_units = r.worker_snapshot.available_capacity_units; wr.resource.queue_depth = r.worker_snapshot.queue_depth; }
-    stats_.dispatches += 1;
+    apply_reported_capacity(wr, r.worker_snapshot);
     emit_event("running", rec.request_id, rec.current_attempt, r.worker, rec.batch_id, "running");
     return Result<void>::success();
   }
@@ -800,16 +919,35 @@ class Scheduler::Impl {
     if (rec.current_attempt != r.attempt_id || rec.generation != r.generation) { out.acceptance = CompletionAcceptance::StaleAttempt; out.reason_code = "stale_attempt"; stats_.stale_rejected += 1; return Result<CompletionOutcome>::ok(std::move(out)); }
     if (is_terminal(rec.state)) { out.acceptance = CompletionAcceptance::Duplicate; out.reason_code = "duplicate_completion"; return Result<CompletionOutcome>::ok(std::move(out)); }
     if (rec.cancellation_committed) { out.acceptance = CompletionAcceptance::CancelledOutcome; out.reason_code = "cancelled"; return Result<CompletionOutcome>::ok(std::move(out)); }
+    // An attempt can only be reported on once it has been handed to a worker,
+    // and only by the worker it was handed to.
+    if (rec.state != RequestState::Reserved && rec.state != RequestState::Dispatched && rec.state != RequestState::Running) { out.acceptance = CompletionAcceptance::Invalid; out.reason_code = "attempt_not_dispatched"; return Result<CompletionOutcome>::ok(std::move(out)); }
+    if (rec.history.empty() || rec.history.back().worker != r.worker) { out.acceptance = CompletionAcceptance::StaleWorker; out.reason_code = "not_assigned_worker"; stats_.stale_rejected += 1; return Result<CompletionOutcome>::ok(std::move(out)); }
+    // The report also carries the worker's capacity after the attempt.
+    if (r.worker_snapshot.total_capacity_units > 0) apply_reported_capacity(wit->second, r.worker_snapshot);
     const ClockTime now = clock_->now();
     if (r.status == CompletionStatus::Succeeded) {
       if (rec.cancellation_requested) { finish_cancelled(rec, r.worker, "cancelled"); out.acceptance = CompletionAcceptance::CancelledOutcome; out.reason_code = "cancelled"; return Result<CompletionOutcome>::ok(std::move(out)); }
       finish_success(rec, r); out.acceptance = CompletionAcceptance::Accepted; out.reason_code = "success"; return Result<CompletionOutcome>::ok(std::move(out));
     }
     if (r.status == CompletionStatus::Cancelled) { finish_cancelled(rec, r.worker, "cancelled"); out.acceptance = CompletionAcceptance::Accepted; out.reason_code = "cancelled"; return Result<CompletionOutcome>::ok(std::move(out)); }
-    if (r.status == CompletionStatus::Expired) { rec.history.back().state = AttemptState::Expired; release_batch_member(rec, r.worker); rec.state = RequestState::Expired; rec.terminal_reason = "deadline_expired"; if (global_admitted_ > 0) global_admitted_ -= 1; auto& t = tenant_of(rec.spec.tenant); if (t.admitted > 0) t.admitted -= 1; if (t.running > 0) t.running -= 1; stats_.requests_expired += 1; out.acceptance = CompletionAcceptance::Accepted; out.reason_code = "expired"; emit_event("expired", rec.request_id, rec.current_attempt, r.worker, rec.batch_id, rec.terminal_reason); return Result<CompletionOutcome>::ok(std::move(out)); }
-    if (r.status == CompletionStatus::Stale) { release_batch_member(rec, r.worker); rec.history.back().state = AttemptState::Stale; out.acceptance = CompletionAcceptance::StaleAttempt; out.reason_code = "stale"; stats_.stale_rejected += 1; return Result<CompletionOutcome>::ok(std::move(out)); }
-    if (r.status == CompletionStatus::Failed || r.status == CompletionStatus::Ambiguous) {
-      bool retryable = r.failure_class == FailureClass::RetryableTransport || r.failure_class == FailureClass::RetryableWorker || (r.failure_class == FailureClass::AmbiguousDispatch && cfg_.retry.retry_on_ambiguous);
+    if (r.status == CompletionStatus::Expired) { rec.history.back().state = AttemptState::Expired; release_batch_member(rec, r.worker); rec.state = RequestState::Expired; rec.terminal_reason = "deadline_expired"; release_admission(rec); leave_running(rec); stats_.requests_expired += 1; stats_.by_latency[latency_index(rec.spec.latency_class)].expired += 1; out.acceptance = CompletionAcceptance::Accepted; out.reason_code = "expired"; emit_event("expired", rec.request_id, rec.current_attempt, r.worker, rec.batch_id, rec.terminal_reason); return Result<CompletionOutcome>::ok(std::move(out)); }
+    if (r.status == CompletionStatus::Failed || r.status == CompletionStatus::Ambiguous || r.status == CompletionStatus::Stale) {
+      // A cancellation that was asked for while the attempt ran commits here,
+      // whatever the attempt came to.
+      if (rec.cancellation_requested) { finish_cancelled(rec, r.worker, "cancelled"); out.acceptance = CompletionAcceptance::CancelledOutcome; out.reason_code = "cancelled"; return Result<CompletionOutcome>::ok(std::move(out)); }
+      if (r.status == CompletionStatus::Stale) {
+        // The worker disowned the attempt. The request is not left without one:
+        // it gets a new attempt, or fails when none is left.
+        CompletionReport lost = r; lost.failure_class = FailureClass::StaleAuthority; lost.error_message = "worker reported the attempt stale";
+        stats_.stale_rejected += 1;
+        const std::size_t disowned = rec.history.size() - 1;
+        if (can_retry(rec, now)) { make_retry(rec, lost); out.retried = true; out.retry_attempt = rec.current_attempt; } else { finish_failed(rec, lost); }
+        rec.history[disowned].state = AttemptState::Stale;
+        out.acceptance = CompletionAcceptance::StaleAttempt; out.reason_code = "stale"; return Result<CompletionOutcome>::ok(std::move(out));
+      }
+      const RetryPolicy& rp = cfg_.retry;
+      bool retryable = (r.failure_class == FailureClass::RetryableTransport && rp.retry_on_transport) || (r.failure_class == FailureClass::RetryableWorker && rp.retry_on_worker_failure) || (r.failure_class == FailureClass::AmbiguousDispatch && rp.retry_on_ambiguous);
       if (retryable && can_retry(rec, now)) { make_retry(rec, r); out.retried = true; out.retry_attempt = rec.current_attempt; out.acceptance = CompletionAcceptance::Accepted; out.reason_code = "retry"; return Result<CompletionOutcome>::ok(std::move(out)); }
       finish_failed(rec, r); out.acceptance = CompletionAcceptance::Accepted; out.reason_code = "failed"; return Result<CompletionOutcome>::ok(std::move(out));
     }
@@ -847,25 +985,39 @@ class Scheduler::Impl {
     if (wr.reserved_units < 0) wr.reserved_units = 0;
     emit_event("worker_registered", RequestId(), AttemptId(), reg.worker, BatchId(), reg.capability.backend);
   }
-  void recover_in_flight(WorkerId worker) {
+  // Everything a worker was holding is lost with it: each member of each batch
+  // reserved or started there gets a new attempt, or fails when it has none
+  // left, and the worker's reservations and running units go back to zero.
+  void recover_in_flight(WorkerId worker, const char* why = "worker_restart") {
     auto wit = workers_.find(worker); if (wit == workers_.end()) return;
     WorkerRecord& wr = wit->second;
     std::vector<RequestId> ids;
+    for (const auto& [bid, members] : wr.batch_members) for (auto rid : members) ids.push_back(rid);
     for (const auto& [rid, att] : wr.in_flight) ids.push_back(rid);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    const ClockTime now = clock_->now();
     for (auto rid : ids) {
       auto rit = requests_.find(rid); if (rit == requests_.end()) continue;
       RequestRecord& rec = rit->second;
-      if (is_terminal(rec.state)) continue;
-      CompletionReport rep; rep.worker = worker; rep.boot_id = wr.registration.boot_id; rep.request_id = rid; rep.attempt_id = rec.current_attempt; rep.generation = rec.generation; rep.status = CompletionStatus::Failed; rep.failure_class = FailureClass::RetryableWorker; rep.error_message = "worker_restart";
-      auto t = tenants_.find(rec.spec.tenant);
-      if (t != tenants_.end() && t->second.running > 0) t->second.running -= 1;
-      if (can_retry(rec, clock_->now())) { make_retry(rec, rep); } else { finish_failed(rec, rep); }
+      if (rec.state != RequestState::Reserved && rec.state != RequestState::Dispatched && rec.state != RequestState::Running) continue;
+      if (rec.history.empty() || rec.history.back().worker != worker) continue;
+      CompletionReport rep; rep.worker = worker; rep.boot_id = wr.registration.boot_id; rep.request_id = rid; rep.attempt_id = rec.current_attempt; rep.generation = rec.generation; rep.status = CompletionStatus::Failed; rep.failure_class = FailureClass::RetryableWorker; rep.error_message = why;
+      if (rec.cancellation_requested) { finish_cancelled(rec, worker, "cancelled"); }
+      else if (cfg_.retry.retry_on_worker_failure && can_retry(rec, now)) { make_retry(rec, rep); }
+      else { finish_failed(rec, rep); }
     }
     wr.in_flight.clear();
-    for (const auto& [bid, u] : wr.batch_units) { wr.reserved_units -= u; global_reserved_units_ -= u; }
+    // Whatever is still on the books belongs to requests that were already
+    // terminal; it comes off the counter it was on.
+    for (const auto& [bid, u] : wr.batch_units) {
+      if (wr.started_batches.count(bid) > 0) { wr.running_units -= u; global_running_units_ -= u; }
+      else { wr.reserved_units -= u; global_reserved_units_ -= u; }
+    }
     wr.batch_units.clear(); wr.batch_pending.clear(); wr.batch_members.clear(); wr.started_batches.clear();
     if (wr.reserved_units < 0) wr.reserved_units = 0; if (wr.running_units < 0) wr.running_units = 0;
     if (global_reserved_units_ < 0) global_reserved_units_ = 0; if (global_running_units_ < 0) global_running_units_ = 0;
+    if (wr.state == WorkerState::Busy) wr.state = WorkerState::Online;
   }
   Result<void> do_update_capability(WorkerId w, const WorkerCapability& cap) {
     std::lock_guard<std::mutex> g(mu_);
@@ -960,9 +1112,10 @@ class Scheduler::Impl {
       ex.notes.push_back("request is terminal: " + std::string(name_of(rec.state)));
       return ex;
     }
-    auto adm = make_admission(rec.spec, now);
-    ex.admission = adm.first; ex.admission_reason_code = adm.second; ex.admitted = adm.first == AdmissionDecision::Admit;
-    ex.admission_explanation = adm.second;
+    // A request that is on record and not terminal was admitted. Running
+    // admission again now would judge it against limits it is itself counted in.
+    ex.admission = AdmissionDecision::Admit; ex.admission_reason_code = "admitted"; ex.admitted = true;
+    ex.admission_explanation = "admitted";
     const FlowKey k = flow_key(rec.spec);
     auto fit = flows_.find(k);
     if (fit != flows_.end()) {
@@ -997,6 +1150,13 @@ class Scheduler::Impl {
   void do_roll_epoch() {
     std::lock_guard<std::mutex> g(mu_);
     epoch_value_ += 1;
+    // Attempts issued under the old epoch can no longer be completed: nothing a
+    // worker reports for them is accepted from here on. They are recovered now
+    // instead of being left reserved or running for good.
+    std::vector<WorkerId> ids;
+    for (const auto& [wk, wr] : workers_) ids.push_back(wk);
+    std::sort(ids.begin(), ids.end());
+    for (const WorkerId w : ids) recover_in_flight(w, "epoch_rollover");
     emit_event("epoch_rollover", RequestId(), AttemptId(), WorkerId(), BatchId(), "epoch=" + std::to_string(epoch_value_));
   }
   Result<void> do_persist(const std::string& path) const {
@@ -1075,54 +1235,116 @@ class Scheduler::Impl {
     return w.buf;
   }
   Result<void> deserialize_locked(std::string_view data) {
+    const auto corrupt = [](const char* what) { return Result<void>::err(make_error(ErrorCode::Corruption, what)); };
     BinReader r; r.s = data;
     std::uint32_t magic = r.u32(); std::uint32_t ver = r.u32();
-    if (!r.ok || magic != 0x49534348u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad magic"));
-    if (ver != 1u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad format version"));
-    requests_.clear(); tenants_.clear(); workers_.clear(); flows_.clear(); compat_.clear(); active_flows_.clear(); queued_.clear();
-    epoch_value_ = r.u64();
-    global_admitted_ = r.i64(); global_queued_ = r.i64(); global_reserved_units_ = r.i64(); global_running_units_ = r.i64(); global_tokens_ = r.i64();
-    std::uint64_t rs0 = r.u64(); stats_.requests_submitted = rs0; stats_.requests_admitted = r.u64(); stats_.requests_completed = r.u64(); stats_.requests_cancelled = r.u64(); stats_.requests_failed = r.u64(); stats_.requests_expired = r.u64(); stats_.attempts_created = r.u64(); stats_.dispatches = r.u64(); stats_.retries = r.u64();
-    std::uint64_t nreq = r.u64(); if (!r.ok || nreq > 10000000u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad request count"));
+    if (!r.ok || magic != 0x49534348u) return corrupt("bad magic");
+    if (ver != 1u) return corrupt("bad format version");
+    // Everything is read and checked into staged containers first: a payload
+    // that turns out to be bad leaves the live scheduler exactly as it was.
+    std::unordered_map<RequestId, RequestRecord> requests;
+    std::unordered_map<TenantId, TenantRecord> tenants;
+    std::unordered_map<WorkerId, WorkerRecord> workers;
+    const std::uint64_t epoch = r.u64();
+    // The counters stored next all follow from the request records. They are
+    // rebuilt from those records below rather than trusted from the file.
+    for (int i = 0; i < 5; ++i) (void)r.i64();
+    std::uint64_t st[9] = {};
+    for (auto& v : st) v = r.u64();
+    std::uint64_t nreq = r.u64(); if (!r.ok || nreq > 10000000u) return corrupt("bad request count");
+    const ClockTime now = clock_->now();
     for (std::uint64_t i = 0; i < nreq; ++i) {
       RequestRecord rec;
-      rec.request_id = r.id<RequestIdTag>(); rec.state = static_cast<RequestState>(r.i32()); rec.current_attempt = r.id<AttemptIdTag>(); rec.generation = r.id<GenerationTag>(); rec.attempts_used = r.i32();
-      if (!r.ok) return Result<void>::err(make_error(ErrorCode::Corruption, "request record truncated"));
-      rec.cancellation_requested = r.yes(); rec.cancellation_committed = r.yes(); rec.cancel_reason = static_cast<CancellationReason>(r.i32()); rec.terminal_reason = r.str();
+      rec.request_id = r.id<RequestIdTag>(); const std::int32_t state = r.i32(); rec.current_attempt = r.id<AttemptIdTag>(); rec.generation = r.id<GenerationTag>(); rec.attempts_used = r.i32();
+      if (!r.ok) return corrupt("request record truncated");
+      rec.cancellation_requested = r.yes(); rec.cancellation_committed = r.yes(); const std::int32_t cancel_reason = r.i32(); rec.terminal_reason = r.str();
       rec.spec.tenant = r.id<TenantIdTag>(); rec.spec.session = r.id<SessionIdTag>(); rec.spec.sequence = r.id<SequenceIdTag>(); rec.spec.model = r.id<ModelIdentityTag>(); rec.spec.revision = r.id<ModelRevisionTag>(); r.opt_id(rec.spec.adapter);
-      rec.spec.phase = static_cast<RequestPhase>(r.i32()); rec.spec.priority = static_cast<PriorityClass>(r.i32()); rec.spec.latency_class = static_cast<LatencyClass>(r.i32());
+      const std::int32_t phase = r.i32(); const std::int32_t priority = r.i32(); const std::int32_t latency = r.i32();
       rec.spec.tokens.input = r.i64(); rec.spec.tokens.output = r.i64(); rec.spec.tokens.decoded = r.i64();
       rec.spec.estimated_memory_bytes = r.i64(); rec.spec.max_batch_size = r.i32(); rec.spec.model_name = r.str();
       rec.spec.demand.memory_bytes = r.i64(); rec.spec.demand.cost_units = r.dbl();
-      std::int64_t rem = r.i64(); if (rem >= 0) rec.spec.deadline = Deadline::after(std::chrono::milliseconds(rem), clock_->now());
-      std::uint64_t nh = r.u64(); if (!r.ok || nh > 4096u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad history count"));
-      for (std::uint64_t j = 0; j < nh; ++j) { AttemptRecord a; a.attempt_id = r.id<AttemptIdTag>(); a.generation = r.id<GenerationTag>(); a.state = static_cast<AttemptState>(r.i32()); a.worker = r.id<WorkerIdTag>(); a.batch = r.id<BatchIdTag>(); a.final_status = static_cast<CompletionStatus>(r.i32()); a.failure_class = static_cast<FailureClass>(r.i32()); a.error_message = r.str(); a.output_tokens = r.i64(); a.work_units = r.i64(); a.duration_us = r.i64(); if (!r.ok) return Result<void>::err(make_error(ErrorCode::Corruption, "attempt record truncated")); rec.history.push_back(std::move(a)); }
-      rec.created_at = clock_->now(); rec.completed_at = clock_->now();
-      requests_.insert({rec.request_id, rec});
+      std::int64_t rem = r.i64();
+      std::uint64_t nh = r.u64(); if (!r.ok || nh > 4096u) return corrupt("bad history count");
+      if (!enum_in_range(state, RequestState::Failed) || !enum_in_range(cancel_reason, CancellationReason::Manual) ||
+          !enum_in_range(phase, RequestPhase::Decode) || !enum_in_range(priority, PriorityClass::Critical) ||
+          !enum_in_range(latency, LatencyClass::Interactive)) return corrupt("request record has an impossible enum value");
+      rec.state = static_cast<RequestState>(state); rec.cancel_reason = static_cast<CancellationReason>(cancel_reason);
+      rec.spec.phase = static_cast<RequestPhase>(phase); rec.spec.priority = static_cast<PriorityClass>(priority); rec.spec.latency_class = static_cast<LatencyClass>(latency);
+      if (!rec.request_id.valid() || rem < -1 || !validate_spec(rec.spec)) return corrupt("request record is not a valid request");
+      // A deadline is stored as the time it had left; one further out than the
+      // clock can represent is as far out as the clock goes.
+      rem = std::min<std::int64_t>(rem, 4000000000000LL);
+      if (rem >= 0) rec.spec.deadline = Deadline::after(std::chrono::milliseconds(rem), now);
+      for (std::uint64_t j = 0; j < nh; ++j) {
+        AttemptRecord a; a.attempt_id = r.id<AttemptIdTag>(); a.generation = r.id<GenerationTag>(); const std::int32_t astate = r.i32(); a.worker = r.id<WorkerIdTag>(); a.batch = r.id<BatchIdTag>(); const std::int32_t fstatus = r.i32(); const std::int32_t fclass = r.i32(); a.error_message = r.str(); a.output_tokens = r.i64(); a.work_units = r.i64(); a.duration_us = r.i64();
+        if (!r.ok) return corrupt("attempt record truncated");
+        if (!enum_in_range(astate, AttemptState::Expired) || !enum_in_range(fstatus, CompletionStatus::Ambiguous) || !enum_in_range(fclass, FailureClass::Internal)) return corrupt("attempt record has an impossible enum value");
+        a.state = static_cast<AttemptState>(astate); a.final_status = static_cast<CompletionStatus>(fstatus); a.failure_class = static_cast<FailureClass>(fclass);
+        rec.history.push_back(std::move(a));
+      }
+      // A request that can still run is identified by its latest attempt.
+      if (!is_terminal(rec.state) && !rec.history.empty() &&
+          (rec.history.back().attempt_id != rec.current_attempt || rec.history.back().generation != rec.generation)) return corrupt("request does not match its latest attempt");
+      rec.created_at = now; rec.completed_at = now;
+      const RequestId rid = rec.request_id;
+      if (!requests.insert({rid, std::move(rec)}).second) return corrupt("duplicate request id");
     }
-    std::uint64_t nten = r.u64(); if (!r.ok || nten > 100000u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad tenant count"));
-    for (std::uint64_t i = 0; i < nten; ++i) { TenantRecord t; t.tenant = r.id<TenantIdTag>(); t.weight = r.dbl(); t.admitted = r.i32(); t.queued = r.i32(); t.running = r.i32(); t.services_consumed = r.i64(); t.service_debt = r.i64(); if (!r.ok) return Result<void>::err(make_error(ErrorCode::Corruption, "tenant record corrupted")); tenants_.insert({t.tenant, t}); }
-    std::uint64_t nwrk = r.u64(); if (!r.ok || nwrk > 100000u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad worker count"));
+    std::uint64_t nten = r.u64(); if (!r.ok || nten > 100000u) return corrupt("bad tenant count");
+    for (std::uint64_t i = 0; i < nten; ++i) {
+      TenantRecord t; t.tenant = r.id<TenantIdTag>(); t.weight = r.dbl(); (void)r.i32(); (void)r.i32(); (void)r.i32(); t.services_consumed = r.i64(); t.service_debt = r.i64();
+      if (!r.ok) return corrupt("tenant record corrupted");
+      tenants.insert({t.tenant, t});
+    }
+    std::uint64_t nwrk = r.u64(); if (!r.ok || nwrk > 100000u) return corrupt("bad worker count");
     for (std::uint64_t i = 0; i < nwrk; ++i) {
       WorkerRecord wr;
       wr.registration.worker = r.id<WorkerIdTag>(); wr.registration.node = r.id<NodeIdTag>(); wr.registration.accelerator = r.id<AcceleratorIdTag>(); wr.registration.boot_id = r.id<WorkerBootIdTag>();
-      wr.state = static_cast<WorkerState>(r.i32()); wr.registration.capability.backend = r.str(); wr.registration.capability.device_name = r.str();
+      const std::int32_t wstate = r.i32(); wr.registration.capability.backend = r.str(); wr.registration.capability.device_name = r.str();
       wr.registration.capability.total_capacity_units = r.i32(); wr.registration.capability.available_capacity_units = r.i32();
       wr.registration.capability.memory_bytes_total = r.i64(); wr.registration.capability.memory_bytes_available = r.i64();
-      std::uint64_t nm = r.u64(); if (!r.ok || nm > 4096u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad model count")); for (std::uint64_t j = 0; j < nm; ++j) wr.registration.capability.models.push_back(r.id<ModelIdentityTag>());
-      std::uint64_t nrv = r.u64(); if (!r.ok || nrv > 4096u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad revision count")); for (std::uint64_t j = 0; j < nrv; ++j) wr.registration.capability.revisions.push_back(r.id<ModelRevisionTag>());
-      std::uint64_t nad = r.u64(); if (!r.ok || nad > 4096u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad adapter count")); for (std::uint64_t j = 0; j < nad; ++j) wr.registration.capability.adapters.push_back(r.id<AdapterIdentityTag>());
-      std::uint64_t nph = r.u64(); if (!r.ok || nph > 16u) return Result<void>::err(make_error(ErrorCode::Corruption, "bad phase count")); for (std::uint64_t j = 0; j < nph; ++j) wr.registration.capability.phases.push_back(static_cast<RequestPhase>(r.i32()));
-      if (!r.ok) return Result<void>::err(make_error(ErrorCode::Corruption, "worker record corrupted"));
+      std::uint64_t nm = r.u64(); if (!r.ok || nm > 4096u) return corrupt("bad model count"); for (std::uint64_t j = 0; j < nm; ++j) wr.registration.capability.models.push_back(r.id<ModelIdentityTag>());
+      std::uint64_t nrv = r.u64(); if (!r.ok || nrv > 4096u) return corrupt("bad revision count"); for (std::uint64_t j = 0; j < nrv; ++j) wr.registration.capability.revisions.push_back(r.id<ModelRevisionTag>());
+      std::uint64_t nad = r.u64(); if (!r.ok || nad > 4096u) return corrupt("bad adapter count"); for (std::uint64_t j = 0; j < nad; ++j) wr.registration.capability.adapters.push_back(r.id<AdapterIdentityTag>());
+      std::uint64_t nph = r.u64(); if (!r.ok || nph > 16u) return corrupt("bad phase count");
+      for (std::uint64_t j = 0; j < nph; ++j) { const std::int32_t ph = r.i32(); if (!enum_in_range(ph, RequestPhase::Decode)) return corrupt("worker record has an impossible enum value"); wr.registration.capability.phases.push_back(static_cast<RequestPhase>(ph)); }
+      if (!r.ok) return corrupt("worker record corrupted");
+      if (!enum_in_range(wstate, WorkerState::Unhealthy) || !wr.registration.worker.valid()) return corrupt("worker record has an impossible value");
+      wr.state = static_cast<WorkerState>(wstate);
       wr.resource.total_capacity_units = wr.registration.capability.total_capacity_units; wr.resource.available_capacity_units = wr.registration.capability.available_capacity_units; wr.resource.memory_bytes_total = wr.registration.capability.memory_bytes_total; wr.resource.memory_bytes_available = wr.registration.capability.memory_bytes_available;
-      workers_.insert({wr.registration.worker, wr});
+      const WorkerId wid = wr.registration.worker;
+      if (!workers.insert({wid, std::move(wr)}).second) return corrupt("duplicate worker id");
     }
-    if (!r.ok) return Result<void>::err(make_error(ErrorCode::Corruption, "trailing corruption at end of payload"));
-    // Re-build the ready index for queued requests. Reset queued counters so the
-    // restore never double-counts them (enqueue_locked increments).
-    global_queued_ = 0;
-    for (auto& [tid, tr] : tenants_) tr.queued = 0;
-    for (const auto& [id, rec] : requests_) { if (rec.state == RequestState::Queued || rec.state == RequestState::Admitted) { enqueue_locked(rec); } }
+    if (!r.ok || r.off != data.size()) return corrupt("trailing corruption at end of payload");
+
+    // The payload is sound: it replaces the live state.
+    requests_.swap(requests); tenants_.swap(tenants); workers_.swap(workers);
+    flows_.clear(); compat_.clear(); active_flows_.clear(); queued_.clear();
+    epoch_value_ = epoch;
+    stats_.requests_submitted = st[0]; stats_.requests_admitted = st[1]; stats_.requests_completed = st[2]; stats_.requests_cancelled = st[3]; stats_.requests_failed = st[4]; stats_.requests_expired = st[5]; stats_.attempts_created = st[6]; stats_.dispatches = st[7]; stats_.retries = st[8];
+    global_admitted_ = 0; global_queued_ = 0; global_reserved_units_ = 0; global_running_units_ = 0; global_tokens_ = 0; active_tenants_ = 0;
+    std::vector<RequestId> live;
+    for (const auto& [id, rec] : requests_) { if (!is_terminal(rec.state)) live.push_back(id); }
+    std::sort(live.begin(), live.end());
+    for (auto id : live) {
+      RequestRecord& rec = requests_[id];
+      const bool handed_out = rec.state == RequestState::Reserved || rec.state == RequestState::Dispatched || rec.state == RequestState::Running || rec.state == RequestState::Completing;
+      if (handed_out) {
+        // Work that was reserved or running when the state was written cannot
+        // be proven alive, and no reservation survives a restart. It comes back
+        // as a new attempt, so a late report for the old one is stale; with a
+        // cancellation pending or no attempt left it ends here instead.
+        if (!rec.history.empty()) { rec.history.back().state = AttemptState::Stale; rec.history.back().final_status = CompletionStatus::Ambiguous; rec.history.back().failure_class = FailureClass::AmbiguousDispatch; }
+        if (rec.cancellation_requested) { rec.state = RequestState::Cancelled; rec.cancellation_committed = true; rec.terminal_reason = "cancelled"; stats_.requests_cancelled += 1; continue; }
+        if (static_cast<int>(rec.history.size()) >= cfg_.retry.max_attempts) { rec.state = RequestState::Failed; rec.terminal_reason = "recovery_attempts_exhausted"; stats_.requests_failed += 1; continue; }
+        rec.generation = id_factory_.next<GenerationTag>(); rec.current_attempt = id_factory_.next<AttemptIdTag>();
+        AttemptRecord a; a.attempt_id = rec.current_attempt; a.generation = rec.generation; a.state = AttemptState::Created; a.created_at = now;
+        rec.history.push_back(a);
+        stats_.attempts_created += 1; stats_.retries += 1;
+      }
+      rec.in_batch = false; rec.batch_id = BatchId(); rec.counted_running = false;
+      hold_admission(rec.spec);
+      enqueue_locked(rec);
+    }
     return Result<void>::success();
   }
   void enqueue_locked(const RequestRecord& rcref) {
@@ -1138,7 +1360,7 @@ class Scheduler::Impl {
   Result<RequestSpec> do_request_spec(RequestId id) const { std::lock_guard<std::mutex> g(mu_); auto it = requests_.find(id); if (it == requests_.end()) return Result<RequestSpec>::err(make_error(ErrorCode::NotFound, "request not found")); return Result<RequestSpec>::ok(it->second.spec); }
   std::size_t do_queued_count() const { std::lock_guard<std::mutex> g(mu_); return static_cast<std::size_t>(global_queued_ < 0 ? 0 : global_queued_); }
   std::size_t do_reserved_count() const { std::lock_guard<std::mutex> g(mu_); std::size_t c = 0; for (const auto& [id, r] : requests_) { if (r.state == RequestState::Reserved || r.state == RequestState::Dispatched) ++c; } return c; }
-  int do_available_capacity() const { std::lock_guard<std::mutex> g(mu_); std::int64_t s = 0; for (const auto& [wk, wr] : workers_) { s += wr.resource.available_capacity_units - wr.reserved_units; } return static_cast<int>(s < 0 ? 0 : s); }
+  int do_available_capacity() const { std::lock_guard<std::mutex> g(mu_); std::int64_t s = 0; for (const auto& [wk, wr] : workers_) { s += std::max<std::int64_t>(0, free_units(wr)); } const std::int64_t top = std::numeric_limits<int>::max(); return static_cast<int>(s > top ? top : s); }
 };
 
 // Scheduler wrapper methods
@@ -1149,7 +1371,11 @@ Scheduler::Scheduler(SchedulerConfig config, std::shared_ptr<Clock> clock, std::
 Scheduler::~Scheduler() = default;
 
 SchedulerConfig Scheduler::config() const { return impl_->cfg_; }
-SchedulerEpoch Scheduler::epoch() const { return SchedulerEpoch(impl_->epoch_value_); }
+SchedulerEpoch Scheduler::epoch() const {
+  // roll_epoch() writes the epoch under the state mutex; read it the same way.
+  std::lock_guard<std::mutex> g(impl_->mu_);
+  return SchedulerEpoch(impl_->epoch_value_);
+}
 std::shared_ptr<Clock> Scheduler::clock() const { return impl_->clock_; }
 
 Result<AdmissionOutput> Scheduler::submit(const RequestSpec& spec, std::optional<RequestId> pre) {

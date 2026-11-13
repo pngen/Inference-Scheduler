@@ -44,6 +44,7 @@ struct Json {
 namespace detail {
 inline bool ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 inline void toks(std::string_view s, std::size_t& i) { while (i < s.size() && ws(s[i])) ++i; }
+constexpr int k_max_json_depth = 64;  // the message vocabulary nests three deep
 }  // namespace detail
 
 
@@ -64,9 +65,12 @@ inline Json parse_json(std::string_view s, bool& ok) {
   struct Parser {
     std::string_view src; bool& ok;
     std::size_t i = 0;
+    // The parser recurses once per nesting level, so the nesting it accepts is
+    // bounded: a frame of nothing but brackets must not run it out of stack.
+    int depth = 0;
     void skip() { while (i < src.size() && detail::ws(src[i])) ++i; }
     bool fail() { ok = false; return false; }
-    Json value() { skip(); if (i >= src.size()) { ok = false; return Json::null(); } char c = src[i]; if (c == '{') return object(); if (c == '[') return array(); if (c == '"') return Json::string(Jstr()); if (c == 't' || c == 'f') return boolean(); if (c == 'n') { expect("null"); return Json::null(); } return number(); }
+    Json value() { skip(); if (i >= src.size()) { ok = false; return Json::null(); } char c = src[i]; if (c == '{' || c == '[') { if (depth >= detail::k_max_json_depth) { ok = false; return Json::null(); } ++depth; Json nested = (c == '{') ? object() : array(); --depth; return nested; } if (c == '"') return Json::string(Jstr()); if (c == 't' || c == 'f') return boolean(); if (c == 'n') { expect("null"); return Json::null(); } return number(); }
     bool expect(std::string_view t) { for (char c : t) { if (i >= src.size() || src[i] != c) return fail(); ++i; } return true; }
     Json object() { ++i; Json j = Json::object(); skip(); if (i < src.size() && src[i] == '}') { ++i; return j; } while (i < src.size()) { skip(); if (i >= src.size() || src[i] != '"') { fail(); return Json::object(); } std::string k = Jstr(); skip(); if (i >= src.size() || src[i] != ':') { fail(); return Json::object(); } ++i; j.obj[std::move(k)] = value(); skip(); if (i < src.size() && src[i] == ',') { ++i; continue; } if (i < src.size() && src[i] == '}') { ++i; return j; } fail(); return Json::object(); } ok = false; return Json::object(); }
     Json array() { ++i; Json j = Json::array(); skip(); if (i < src.size() && src[i] == ']') { ++i; return j; } while (i < src.size()) { j.arr.push_back(value()); skip(); if (i < src.size() && src[i] == ',') { ++i; continue; } if (i < src.size() && src[i] == ']') { ++i; return j; } fail(); return j; } ok = false; return j; }

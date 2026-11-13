@@ -55,6 +55,12 @@ bool LocalDriver::dispatch_one(std::size_t& bcount) {
   }
   if (reqs.empty()) return false;
   auto results = ex_->run(reqs);
+  // The capacity reported with a start is the capacity of the worker that ran
+  // the batch, not of whichever worker happens to be listed first.
+  int worker_units = 0;
+  for (std::size_t i = 0; i < workers_.size(); ++i) {
+    if (workers_[i].worker == out.worker_id) worker_units = avail_units_[i];
+  }
   // Confirm start for every member (Reserved -> Running).
   for (const auto& w : reqs) {
     CompletionReport start;
@@ -64,8 +70,8 @@ bool LocalDriver::dispatch_one(std::size_t& bcount) {
     start.request_id = w.request_id;
     start.attempt_id = w.attempt_id;
     start.generation = w.generation;
-    start.worker_snapshot.available_capacity_units = avail_units_[0];
-    start.worker_snapshot.total_capacity_units = avail_units_[0];
+    start.worker_snapshot.available_capacity_units = worker_units;
+    start.worker_snapshot.total_capacity_units = worker_units;
     sched_.confirm_dispatch_start(start);
   }
   for (const auto& res : results) {

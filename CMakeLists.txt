@@ -107,7 +107,7 @@ if(IS_BUILD_EXAMPLES)
 endif()
 
 if(IS_BUILD_TESTS)
-  set(IS_TEST_PROGRAMS smoke adversarial_test admission_test fairness_test deadline_test cancel_retry_test batch_test stale_test state_machine_test persistence_test property_test)
+  set(IS_TEST_PROGRAMS smoke adversarial_test admission_test fairness_test deadline_test cancel_retry_test batch_test stale_test state_machine_test persistence_test property_test invariant_test)
   foreach(t ${IS_TEST_PROGRAMS})
     add_executable(${t} tests/${t}.cpp)
     target_link_libraries(${t} PRIVATE inference_scheduler)
